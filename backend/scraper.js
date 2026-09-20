@@ -4,14 +4,49 @@ const path = require('path');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Normalizes unicode (including full-width digits like ４,６０４) and extracts numeric price.
+ * Normalizes unicode, rejects ambiguous/multiple prices, preserves decimals.
+ * @param {string} rawText
+ * @returns {{rawText: string, numericPrice: number, displayPrice: string}|null}
  */
-function parseMoney(value) {
-  if (!value || typeof value !== 'string') return null;
-  // Use NFKC normalization to convert full-width unicode numbers to standard ASCII digits
-  const normalized = value.normalize('NFKC');
-  const clean = normalized.replace(/[^\d]/g, '');
-  return clean ? '₹' + Number(clean).toLocaleString('en-IN') : null;
+function parseMoney(rawText) {
+  if (!rawText || typeof rawText !== 'string') return null;
+
+  // 1. Normalize unicode (NFKC converts full-width digits, unicode spaces, etc.)
+  const normalized = rawText.normalize('NFKC').trim();
+
+  // 2. Reject multiple distinct prices in one string
+  const currencyMatches = normalized.match(/₹|Rs\.?|INR/gi) || [];
+  if (currencyMatches.length > 1) {
+    return null; // Ambiguous: multiple prices present
+  }
+
+  // 3. Handle number format (preserve decimals, strip formatting commas/spaces)
+  let clean = normalized;
+  if (/\d+\.\d{3},\d{2}/.test(clean)) {
+    // European style e.g. 4.604,50 -> 4604.50
+    clean = clean.replace(/\./g, '').replace(',', '.');
+  } else {
+    // Standard Indian / International format: strip commas, keep decimal point
+    clean = clean.replace(/,/g, '');
+  }
+
+  // Extract single numeric sequence with optional decimal fraction
+  const match = clean.match(/(\d+(?:\.\d+)?)/);
+  if (!match) return null;
+
+  const numericPrice = parseFloat(match[1]);
+  if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
+    return null;
+  }
+
+  return {
+    rawText: rawText,
+    numericPrice: numericPrice,
+    displayPrice: '₹' + numericPrice.toLocaleString('en-IN', {
+      minimumFractionDigits: numericPrice % 1 === 0 ? 0 : 2,
+      maximumFractionDigits: 2
+    })
+  };
 }
 
 /**
@@ -28,9 +63,9 @@ function parseStock(value) {
 }
 
 /**
- * Scrapes product page with anti-bot unlock, bounded timeouts, and attempt callback.
+ * Scrapes product page with anti-bot unlock, bounded timeouts, and transparent attempt logging.
  */
-async function runScraper(url, headed = false, onAttempt = null) {
+async function runScraper(url, targetProductId = null, headed = false, onAttempt = null) {
   let lastError = null;
   const MAX_ATTEMPTS = 3;
 
@@ -56,6 +91,11 @@ async function runScraper(url, headed = false, onAttempt = null) {
       console.log(`[Attempt ${attempt}/${MAX_ATTEMPTS}] Navigating to: ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
+      // Verify product identity in URL
+      if (targetProductId && !page.url().includes(String(targetProductId))) {
+        throw new Error(`Product identity mismatch: expected product ${targetProductId} but URL is ${page.url()}`);
+      }
+
       // Dismiss cookie banner
       const cookieAccept = page.getByRole('button', { name: /accept/i });
       if (await cookieAccept.isVisible().catch(() => false)) {
@@ -64,97 +104,126 @@ async function runScraper(url, headed = false, onAttempt = null) {
       await page.evaluate(() => {
         document.querySelectorAll('.cookie-overlay, .cookie-banner, [class*="cookie"]').forEach(el => el.remove());
       }).catch(() => {});
-      await delay(500);
+      await delay(400);
 
-      // Locate price reveal button (15s timeout)
-      const button = page.getByRole('button', { name: /reveal price/i });
-      await button.waitFor({ state: 'visible', timeout: 15000 });
-      const box = await button.boundingBox();
-      if (!box) throw new Error('Reveal-price button has no visible bounds');
-
-      // Human-like cursor interaction over button to trigger anti-bot unlock
-      for (let step = 0; step < 10; step++) {
-        await page.mouse.move(box.x + 8 + step * 4, box.y + 8 + (step % 3) * 3);
-        await delay(80);
+      // Locate price block and perform simulated cursor movement to satisfy bot challenge
+      const priceBlock = page.locator('.price-block');
+      await priceBlock.waitFor({ state: 'visible', timeout: 15000 });
+      const box = await priceBlock.boundingBox();
+      if (box) {
+        for (let s = 0; s < 12; s++) {
+          await page.mouse.move(box.x + 12 + s * 8, box.y + 12 + (s % 3) * 6);
+          await delay(90);
+        }
       }
-      await delay(600);
-      await button.click({ force: true });
 
-      // Handle price success or transient error retry
+      // Bounded wait for the reveal button to become enabled (real readiness condition)
+      const revealBtn = page.getByRole('button', { name: /reveal price/i });
+      await page.waitForFunction(() => {
+        const btn = document.querySelector('button[aria-label="Reveal price"]') || 
+                    [...document.querySelectorAll('button')].find(b => /reveal price/i.test(b.textContent));
+        return btn && !btn.hasAttribute('disabled');
+      }, { timeout: 15000 });
+
+      // Click the enabled button naturally
+      await revealBtn.click();
+
+      // Handle outcome: price resolution vs transient "Try again" error
       const outcome = await Promise.race([
         page.locator('.price-success').waitFor({ state: 'visible', timeout: 18000 }).then(() => 'success'),
         page.locator('.price-block button:has-text("Try again")').waitFor({ state: 'visible', timeout: 18000 }).then(() => 'retry')
       ]);
 
       if (outcome === 'retry') {
-        console.log(`[Attempt ${attempt}] Store returned transient error, clicking 'Try again'...`);
+        console.log(`[Attempt ${attempt}] Store returned transient error, recording in-page recovery...`);
+        if (onAttempt) {
+          await onAttempt({
+            status: 'RETRIED',
+            durationMs: Date.now() - attemptStartTime,
+            errorMessage: 'Transient store error encountered (clicked "Try again")',
+            attempt
+          });
+        }
         const tryAgain = page.locator('.price-block button:has-text("Try again")');
         if (await tryAgain.count() > 0) {
-          await tryAgain.first().click({ force: true });
+          await tryAgain.first().click();
         }
         await page.locator('.price-success').waitFor({ state: 'visible', timeout: 18000 });
       }
 
-      await delay(500);
+      await delay(400);
 
-      // Extract resolved current deal price and stock
+      // Extract resolved current deal price using leaf node filtering (avoids containers and MRP)
       const quote = await page.locator('.price-success').evaluate(node => {
-        // Prioritize specific current deal price element over old strike-through price
-        const priceNode = [...node.querySelectorAll('.price-main > *')]
-          .find(el => el.style && el.style.fontSize === '2.4rem') || 
-          node.querySelector('.deal-price') || 
-          node.querySelector('.price-main') || 
-          node.querySelector('.current-price');
-        
-        const stockNode = node.querySelector('.stock-badge') || [...node.querySelectorAll('*')]
-          .find(el => /(?:in stock|left|out of stock)/i.test(el.textContent || ''));
+        const priceMain = node.querySelector('.price-main') || node;
+        const candidates = [...priceMain.querySelectorAll('*')];
 
-        const sellerNode = [...node.querySelectorAll('*')]
-          .find(el => /sold by/i.test(el.textContent || ''));
+        const validPriceNodes = candidates.filter(el => {
+          if (el.children.length > 0) return false; // Leaf node only
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || el.getAttribute('aria-hidden') === 'true') {
+            return false; // Ignore hidden decoy prices
+          }
+          if (style.textDecorationLine?.includes('line-through') || style.textDecoration?.includes('line-through')) {
+            return false; // Ignore crossed-out MRP prices
+          }
+          const text = (el.textContent || '').trim();
+          if (/deal price/i.test(text) || /% off/i.test(text) || /updating/i.test(text)) {
+            return false; // Ignore secondary labels
+          }
+          return /[0-9\uFF10-\uFF19]/.test(text.normalize('NFKC'));
+        });
+
+        const currentPriceNode = validPriceNodes[0] || null;
+        const stockNode = node.querySelector('.stock-badge') || 
+                          [...node.querySelectorAll('*')].find(el => 
+                            el.children.length === 0 && /(?:in stock|left|out of stock)/i.test(el.textContent || '')
+                          );
+
+        const sellerNode = [...node.querySelectorAll('*')].find(el => 
+          el.children.length === 0 && /sold by/i.test(el.textContent || '')
+        );
 
         return {
-          rawPrice: priceNode ? priceNode.textContent.trim() : null,
+          rawPrice: currentPriceNode ? currentPriceNode.textContent.trim() : null,
           rawStock: stockNode ? stockNode.textContent.trim() : null,
           seller: sellerNode ? sellerNode.textContent.replace(/sold by/i, '').trim() : null
         };
       });
 
-      console.log(`[Attempt ${attempt}] Raw scraped quote:`, quote);
+      console.log(`[Attempt ${attempt}] Scraped quote:`, quote);
 
       await page.close();
       await context.close();
       await browser.close();
 
-      const priceRaw = parseMoney(quote.rawPrice);
+      const parsedPrice = parseMoney(quote.rawPrice);
       const stockStatus = parseStock(quote.rawStock);
 
-      if (!priceRaw) {
-        throw new Error('Price was empty or invalid after resolution');
+      if (!parsedPrice) {
+        throw new Error(`Price resolution failed or ambiguous: "${quote.rawPrice}"`);
       }
 
       const attemptDuration = Date.now() - attemptStartTime;
-
-      // Note if stock extraction was incomplete
-      let note = null;
-      if (stockStatus === 'Unknown') {
-        note = 'Incomplete extraction: stock information was missing or unparseable';
-      }
+      const isStockIncomplete = (stockStatus === 'Unknown');
 
       if (onAttempt) {
         await onAttempt({
           status: 'SUCCESS',
           durationMs: attemptDuration,
-          priceRaw,
-          stockStatus,
-          errorMessage: note,
+          priceRaw: parsedPrice.displayPrice,
+          stockStatus: stockStatus,
+          errorMessage: isStockIncomplete ? 'Incomplete extraction: stock information was missing or unparseable' : null,
           attempt
         });
       }
 
       return {
-        priceRaw,
-        stockStatus,
-        isIncompleteStock: stockStatus === 'Unknown',
+        priceRaw: parsedPrice.displayPrice,
+        numericPrice: parsedPrice.numericPrice,
+        rawText: parsedPrice.rawText,
+        stockStatus: stockStatus,
+        isIncompleteStock: isStockIncomplete,
         seller: quote.seller || 'INE Official Store'
       };
 
