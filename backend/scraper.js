@@ -11,16 +11,12 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function parseMoney(rawText) {
   if (!rawText || typeof rawText !== 'string') return null;
 
-  // 1. Normalize unicode (NFKC converts full-width digits, unicode spaces, etc.)
   const normalized = rawText.normalize('NFKC').trim();
 
-  // 2. Reject multiple distinct prices in one string
+  // Reject ambiguous text containing multiple prices
   const currencyMatches = normalized.match(/₹|Rs\.?|INR/gi) || [];
-  if (currencyMatches.length > 1) {
-    return null; // Ambiguous: multiple prices present
-  }
+  if (currencyMatches.length > 1) return null;
 
-  // 3. Handle number format (preserve decimals, strip formatting commas/spaces)
   let clean = normalized;
   if (/\d+\.\d{3},\d{2}/.test(clean)) {
     // European style e.g. 4.604,50 -> 4604.50
@@ -30,14 +26,11 @@ function parseMoney(rawText) {
     clean = clean.replace(/,/g, '');
   }
 
-  // Extract single numeric sequence with optional decimal fraction
   const match = clean.match(/(\d+(?:\.\d+)?)/);
   if (!match) return null;
 
   const numericPrice = parseFloat(match[1]);
-  if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
-    return null;
-  }
+  if (!Number.isFinite(numericPrice) || numericPrice <= 0) return null;
 
   return {
     rawText: rawText,
@@ -60,6 +53,23 @@ function parseStock(value) {
   if (match) return match[1] + ' in stock';
   if (/in stock/i.test(trimmed)) return 'In stock';
   return 'Unknown';
+}
+
+/**
+ * Extracts product ID from URL path (e.g. '/product/434' -> '434')
+ */
+function extractProductIdFromUrl(urlStr) {
+  try {
+    const pathname = new URL(urlStr).pathname;
+    const parts = pathname.split('/').filter(Boolean);
+    const prodIdx = parts.indexOf('product');
+    if (prodIdx !== -1 && parts[prodIdx + 1]) {
+      return parts[prodIdx + 1];
+    }
+    return parts[parts.length - 1] || null;
+  } catch (e) {
+    return null;
+  }
 }
 
 /**
@@ -91,9 +101,12 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
       console.log(`[Attempt ${attempt}/${MAX_ATTEMPTS}] Navigating to: ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-      // Verify product identity in URL
-      if (targetProductId && !page.url().includes(String(targetProductId))) {
-        throw new Error(`Product identity mismatch: expected product ${targetProductId} but URL is ${page.url()}`);
+      // Exact product ID comparison from URL path
+      if (targetProductId) {
+        const actualId = extractProductIdFromUrl(page.url());
+        if (actualId !== String(targetProductId)) {
+          throw new Error(`Product identity mismatch: expected ID "${targetProductId}", but page URL is "${page.url()}" (parsed: "${actualId}")`);
+        }
       }
 
       // Dismiss cookie banner
@@ -117,13 +130,13 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
         }
       }
 
-      // Bounded wait for the reveal button to become enabled (real readiness condition)
+      // Correct Playwright API call: options is the 3rd argument (after pageFunction and undefined arg)
       const revealBtn = page.getByRole('button', { name: /reveal price/i });
       await page.waitForFunction(() => {
         const btn = document.querySelector('button[aria-label="Reveal price"]') || 
                     [...document.querySelectorAll('button')].find(b => /reveal price/i.test(b.textContent));
         return btn && !btn.hasAttribute('disabled');
-      }, { timeout: 15000 });
+      }, undefined, { timeout: 15000 });
 
       // Click the enabled button naturally
       await revealBtn.click();
@@ -137,12 +150,16 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
       if (outcome === 'retry') {
         console.log(`[Attempt ${attempt}] Store returned transient error, recording in-page recovery...`);
         if (onAttempt) {
-          await onAttempt({
-            status: 'RETRIED',
-            durationMs: Date.now() - attemptStartTime,
-            errorMessage: 'Transient store error encountered (clicked "Try again")',
-            attempt
-          });
+          try {
+            await onAttempt({
+              status: 'RETRIED',
+              durationMs: Date.now() - attemptStartTime,
+              errorMessage: 'Transient store error encountered (clicked "Try again")',
+              attempt
+            });
+          } catch (logErr) {
+            console.error('[In-page Log Warning]:', logErr.message);
+          }
         }
         const tryAgain = page.locator('.price-block button:has-text("Try again")');
         if (await tryAgain.count() > 0) {
@@ -153,23 +170,23 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
 
       await delay(400);
 
-      // Extract resolved current deal price using leaf node filtering (avoids containers and MRP)
+      // Extract resolved current deal price using leaf node filtering
       const quote = await page.locator('.price-success').evaluate(node => {
         const priceMain = node.querySelector('.price-main') || node;
         const candidates = [...priceMain.querySelectorAll('*')];
 
         const validPriceNodes = candidates.filter(el => {
-          if (el.children.length > 0) return false; // Leaf node only
+          if (el.children.length > 0) return false;
           const style = window.getComputedStyle(el);
           if (style.display === 'none' || style.visibility === 'hidden' || el.getAttribute('aria-hidden') === 'true') {
-            return false; // Ignore hidden decoy prices
+            return false;
           }
           if (style.textDecorationLine?.includes('line-through') || style.textDecoration?.includes('line-through')) {
-            return false; // Ignore crossed-out MRP prices
+            return false;
           }
           const text = (el.textContent || '').trim();
           if (/deal price/i.test(text) || /% off/i.test(text) || /updating/i.test(text)) {
-            return false; // Ignore secondary labels
+            return false;
           }
           return /[0-9\uFF10-\uFF19]/.test(text.normalize('NFKC'));
         });
@@ -208,14 +225,18 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
       const isStockIncomplete = (stockStatus === 'Unknown');
 
       if (onAttempt) {
-        await onAttempt({
-          status: 'SUCCESS',
-          durationMs: attemptDuration,
-          priceRaw: parsedPrice.displayPrice,
-          stockStatus: stockStatus,
-          errorMessage: isStockIncomplete ? 'Incomplete extraction: stock information was missing or unparseable' : null,
-          attempt
-        });
+        try {
+          await onAttempt({
+            status: 'SUCCESS',
+            durationMs: attemptDuration,
+            priceRaw: parsedPrice.displayPrice,
+            stockStatus: stockStatus,
+            errorMessage: isStockIncomplete ? 'Incomplete extraction: stock information was missing or unparseable' : null,
+            attempt
+          });
+        } catch (logErr) {
+          console.error('[Attempt Success Log Warning]:', logErr.message);
+        }
       }
 
       return {
@@ -238,12 +259,16 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
       }
 
       if (onAttempt) {
-        await onAttempt({
-          status: isLast ? 'FAILED' : 'RETRIED',
-          durationMs: attemptDuration,
-          errorMessage: err.message,
-          attempt
-        });
+        try {
+          await onAttempt({
+            status: isLast ? 'FAILED' : 'RETRIED',
+            durationMs: attemptDuration,
+            errorMessage: err.message,
+            attempt
+          });
+        } catch (logErr) {
+          console.error('[Attempt Failure Log Warning]:', logErr.message);
+        }
       }
 
       if (!isLast) {
@@ -257,4 +282,4 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
   throw new Error(`Scrape failed after ${MAX_ATTEMPTS} attempts: ${lastError ? lastError.message : 'Unknown error'}`);
 }
 
-module.exports = { runScraper, parseStock, parseMoney };
+module.exports = { runScraper, parseStock, parseMoney, extractProductIdFromUrl };

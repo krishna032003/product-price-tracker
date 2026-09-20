@@ -27,7 +27,6 @@ let lastCatalogFetch = 0;
  */
 async function getFullCatalog() {
   const now = Date.now();
-  // Return cached catalog if fresh (< 1 hour)
   if (catalogCache.length > 0 && (now - lastCatalogFetch < 3600000)) {
     return { items: catalogCache, isStale: false };
   }
@@ -80,7 +79,9 @@ async function getFullCatalog() {
 }
 
 /**
- * Shared persistence helper with explicit error distinction and partial persistence detection.
+ * Persists scrape result with rollback compensation on partial failure.
+ * If tracked_products update fails after price_history insert, the history entry is deleted
+ * to prevent orphaned duplicate rows when scraping is retried.
  */
 async function persistScrapeResult(product, scrapeResult) {
   const numericPrice = scrapeResult.numericPrice;
@@ -88,27 +89,42 @@ async function persistScrapeResult(product, scrapeResult) {
     throw new Error(`Invalid extracted price: "${scrapeResult.priceRaw}"`);
   }
 
-  // 1. Insert into price history
-  const { error: histErr } = await supabase.from('price_history').insert({
-    tracked_product_id: product.id,
-    price: numericPrice,
-    price_raw: scrapeResult.priceRaw,
-    stock_status: scrapeResult.stockStatus
-  });
+  // 1. Insert into price history and capture the new record ID
+  const { data: histData, error: histErr } = await supabase
+    .from('price_history')
+    .insert({
+      tracked_product_id: product.id,
+      price: numericPrice,
+      price_raw: scrapeResult.priceRaw,
+      stock_status: scrapeResult.stockStatus
+    })
+    .select('id')
+    .single();
+
   if (histErr) {
-    throw new Error(`Persistence failure (price_history): ${histErr.message}`);
+    throw new Error(`Persistence failure (price_history insert failed): ${histErr.message}`);
   }
 
   // 2. Update tracked product header
-  const { error: prodErr } = await supabase.from('tracked_products').update({
-    last_scraped_at: new Date().toISOString(),
-    latest_price: numericPrice,
-    latest_stock_status: scrapeResult.stockStatus
-  }).eq('id', product.id);
+  const { error: prodErr } = await supabase
+    .from('tracked_products')
+    .update({
+      last_scraped_at: new Date().toISOString(),
+      latest_price: numericPrice,
+      latest_stock_status: scrapeResult.stockStatus
+    })
+    .eq('id', product.id);
+
   if (prodErr) {
-    // History saved, but product header failed
-    throw new Error(`Partial persistence: price history saved, but product record update failed: ${prodErr.message}`);
+    // Roll back history insert to prevent orphaned duplicate history on subsequent retry
+    if (histData && histData.id) {
+      console.warn(`[Compensating Rollback] Deleting price_history row ${histData.id} due to product update failure`);
+      await supabase.from('price_history').delete().eq('id', histData.id).catch(() => {});
+    }
+    throw new Error(`Persistence failure (product header update failed; history insert was rolled back): ${prodErr.message}`);
   }
+
+  return { historyId: histData?.id, status: 'COMMITTED' };
 }
 
 app.get('/api/health', (req, res) => {
@@ -140,7 +156,6 @@ app.post('/api/cron/scrape', async (req, res) => {
     const results = [];
 
     for (const product of products) {
-      // Concurrency lock check
       if (activeScrapes.has(product.id)) {
         console.log(`[Cron Scrape] Skipping ${product.name}, scrape already in progress.`);
         results.push({ productId: product.product_id, status: 'SKIPPED', reason: 'Already in progress' });
@@ -150,7 +165,7 @@ app.post('/api/cron/scrape', async (req, res) => {
       activeScrapes.add(product.id);
       console.log(`[Cron Scrape] Starting for: ${product.name} (ID: ${product.product_id})`);
 
-      // Telemetry log callback (isolated so log errors don't restart or mask scraper)
+      let logErrorWarning = null;
       const onAttempt = async (attemptData) => {
         try {
           const { error: logErr } = await supabase.from('scrape_logs').insert({
@@ -161,8 +176,12 @@ app.post('/api/cron/scrape', async (req, res) => {
             scraped_price_raw: attemptData.priceRaw || null,
             scraped_stock_status: attemptData.stockStatus || null
           });
-          if (logErr) console.error('[Cron Telemetry Log Error]:', logErr.message);
+          if (logErr) {
+            logErrorWarning = logErr.message;
+            console.error('[Cron Log Insert Error]:', logErr.message);
+          }
         } catch (logErr) {
+          logErrorWarning = logErr.message;
           console.error('[Cron Telemetry Write Exception]:', logErr.message);
         }
       };
@@ -171,7 +190,13 @@ app.post('/api/cron/scrape', async (req, res) => {
         const targetUrl = `https://demo.inelabteamdev.com/product/${product.product_id}`;
         const scrapeResult = await runScraper(targetUrl, product.product_id, false, onAttempt);
         await persistScrapeResult(product, scrapeResult);
-        results.push({ productId: product.product_id, status: 'SUCCESS', price: scrapeResult.numericPrice });
+
+        results.push({
+          productId: product.product_id,
+          status: 'SUCCESS',
+          price: scrapeResult.numericPrice,
+          auditLogging: logErrorWarning ? `DEGRADED: ${logErrorWarning}` : 'COMPLETE'
+        });
       } catch (err) {
         console.error(`[Cron Scrape] Failed for ${product.name}:`, err.message);
         results.push({ productId: product.product_id, status: 'FAILED', error: err.message });
@@ -222,7 +247,6 @@ app.post('/api/products/:id/scrape', async (req, res) => {
     return res.status(404).json({ error: 'Tracked product not found' });
   }
 
-  // Concurrency lock check
   if (activeScrapes.has(product.id)) {
     return res.status(409).json({ error: `Scrape already in progress for ${product.name}` });
   }
@@ -230,7 +254,7 @@ app.post('/api/products/:id/scrape', async (req, res) => {
   activeScrapes.add(product.id);
   console.log(`[Manual Scrape] Starting for ${product.name} (ID: ${product.product_id})`);
 
-  // Isolated telemetry logger
+  let logErrorWarning = null;
   const onAttempt = async (attemptData) => {
     try {
       const { error: logErr } = await supabase.from('scrape_logs').insert({
@@ -241,15 +265,17 @@ app.post('/api/products/:id/scrape', async (req, res) => {
         scraped_price_raw: attemptData.priceRaw || null,
         scraped_stock_status: attemptData.stockStatus || null
       });
-      if (logErr) console.error('[Manual Telemetry Log Error]:', logErr.message);
+      if (logErr) {
+        logErrorWarning = logErr.message;
+        console.error('[Manual Log Insert Error]:', logErr.message);
+      }
     } catch (logErr) {
+      logErrorWarning = logErr.message;
       console.error('[Manual Telemetry Write Exception]:', logErr.message);
     }
   };
 
   let scrapeResult = null;
-  let scrapeError = null;
-
   try {
     const targetUrl = `https://demo.inelabteamdev.com/product/${product.product_id}`;
     scrapeResult = await runScraper(targetUrl, product.product_id, false, onAttempt);
@@ -257,7 +283,9 @@ app.post('/api/products/:id/scrape', async (req, res) => {
 
     return res.json({
       success: true,
-      message: 'Product scraped and persisted successfully',
+      extraction: 'SUCCESS',
+      persistence: 'COMMITTED',
+      auditLogging: logErrorWarning ? `DEGRADED: ${logErrorWarning}` : 'COMPLETE',
       data: {
         ...product,
         latest_price: scrapeResult.numericPrice,
@@ -267,9 +295,13 @@ app.post('/api/products/:id/scrape', async (req, res) => {
       scrapeResult
     });
   } catch (err) {
-    scrapeError = err.message;
-    console.error('[Manual Scrape Route Error]:', scrapeError);
-    return res.status(500).json({ success: false, error: scrapeError });
+    console.error('[Manual Scrape Route Error]:', err.message);
+    return res.status(500).json({
+      success: false,
+      extraction: scrapeResult ? 'SUCCESS' : 'FAILED',
+      persistence: 'FAILED',
+      error: err.message
+    });
   } finally {
     activeScrapes.delete(product.id);
   }
