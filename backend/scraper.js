@@ -1,14 +1,22 @@
-const { chromium } = require('playwright');
+﻿const { chromium } = require('playwright');
 const path = require('path');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+/**
+ * Normalizes unicode (including full-width digits like ４,６０４) and extracts numeric price.
+ */
 function parseMoney(value) {
-  if (!value) return null;
-  const clean = value.replace(/[^\d]/g, '');
+  if (!value || typeof value !== 'string') return null;
+  // Use NFKC normalization to convert full-width unicode numbers to standard ASCII digits
+  const normalized = value.normalize('NFKC');
+  const clean = normalized.replace(/[^\d]/g, '');
   return clean ? '₹' + Number(clean).toLocaleString('en-IN') : null;
 }
 
+/**
+ * Extracts stock information. Defaults to 'Unknown' unless explicitly declared.
+ */
 function parseStock(value) {
   if (!value || typeof value !== 'string') return 'Unknown';
   const trimmed = value.trim();
@@ -20,11 +28,7 @@ function parseStock(value) {
 }
 
 /**
- * Scrape the mock store product page for price and stock.
- * @param {string} url - The URL of the product page
- * @param {boolean} headed - Whether to run in headed mode
- * @param {Function} [onAttempt] - Callback: async ({ status, durationMs, errorMessage, priceRaw, stockStatus, attempt }) => void
- * @returns {Promise<{priceRaw: string, stockStatus: string, seller: string}>}
+ * Scrapes product page with anti-bot unlock, bounded timeouts, and attempt callback.
  */
 async function runScraper(url, headed = false, onAttempt = null) {
   let lastError = null;
@@ -52,7 +56,7 @@ async function runScraper(url, headed = false, onAttempt = null) {
       console.log(`[Attempt ${attempt}/${MAX_ATTEMPTS}] Navigating to: ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-      // Dismiss cookie banner and remove overlay
+      // Dismiss cookie banner
       const cookieAccept = page.getByRole('button', { name: /accept/i });
       if (await cookieAccept.isVisible().catch(() => false)) {
         await cookieAccept.click().catch(() => {});
@@ -62,13 +66,13 @@ async function runScraper(url, headed = false, onAttempt = null) {
       }).catch(() => {});
       await delay(500);
 
-      // Find the reveal button (with 15s timeout to prevent hanging)
+      // Locate price reveal button (15s timeout)
       const button = page.getByRole('button', { name: /reveal price/i });
       await button.waitFor({ state: 'visible', timeout: 15000 });
       const box = await button.boundingBox();
       if (!box) throw new Error('Reveal-price button has no visible bounds');
 
-      // Natural mouse movement over the button to trigger anti-bot verification
+      // Human-like cursor interaction over button to trigger anti-bot unlock
       for (let step = 0; step < 10; step++) {
         await page.mouse.move(box.x + 8 + step * 4, box.y + 8 + (step % 3) * 3);
         await delay(80);
@@ -76,14 +80,14 @@ async function runScraper(url, headed = false, onAttempt = null) {
       await delay(600);
       await button.click({ force: true });
 
-      // Check if .price-success resolves or if a 'Try again' error button appears
+      // Handle price success or transient error retry
       const outcome = await Promise.race([
         page.locator('.price-success').waitFor({ state: 'visible', timeout: 18000 }).then(() => 'success'),
         page.locator('.price-block button:has-text("Try again")').waitFor({ state: 'visible', timeout: 18000 }).then(() => 'retry')
       ]);
 
       if (outcome === 'retry') {
-        console.log(`[Attempt ${attempt}] Store gave transient error, clicking 'Try again'...`);
+        console.log(`[Attempt ${attempt}] Store returned transient error, clicking 'Try again'...`);
         const tryAgain = page.locator('.price-block button:has-text("Try again")');
         if (await tryAgain.count() > 0) {
           await tryAgain.first().click({ force: true });
@@ -93,10 +97,14 @@ async function runScraper(url, headed = false, onAttempt = null) {
 
       await delay(500);
 
-      // Extract resolved price and stock from .price-success
+      // Extract resolved current deal price and stock
       const quote = await page.locator('.price-success').evaluate(node => {
+        // Prioritize specific current deal price element over old strike-through price
         const priceNode = [...node.querySelectorAll('.price-main > *')]
-          .find(el => el.style && el.style.fontSize === '2.4rem') || node.querySelector('.price-main');
+          .find(el => el.style && el.style.fontSize === '2.4rem') || 
+          node.querySelector('.deal-price') || 
+          node.querySelector('.price-main') || 
+          node.querySelector('.current-price');
         
         const stockNode = node.querySelector('.stock-badge') || [...node.querySelectorAll('*')]
           .find(el => /(?:in stock|left|out of stock)/i.test(el.textContent || ''));
@@ -126,12 +134,19 @@ async function runScraper(url, headed = false, onAttempt = null) {
 
       const attemptDuration = Date.now() - attemptStartTime;
 
+      // Note if stock extraction was incomplete
+      let note = null;
+      if (stockStatus === 'Unknown') {
+        note = 'Incomplete extraction: stock information was missing or unparseable';
+      }
+
       if (onAttempt) {
         await onAttempt({
           status: 'SUCCESS',
           durationMs: attemptDuration,
           priceRaw,
           stockStatus,
+          errorMessage: note,
           attempt
         });
       }
@@ -139,6 +154,7 @@ async function runScraper(url, headed = false, onAttempt = null) {
       return {
         priceRaw,
         stockStatus,
+        isIncompleteStock: stockStatus === 'Unknown',
         seller: quote.seller || 'INE Official Store'
       };
 
