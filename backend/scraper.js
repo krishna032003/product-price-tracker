@@ -1,162 +1,137 @@
-const { chromium } = require('playwright');
+﻿const { chromium } = require('playwright');
+
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function parseMoney(value) {
+  if (!value) return null;
+  const clean = value.replace(/[^\d]/g, '');
+  return clean ? '₹' + Number(clean).toLocaleString('en-IN') : value;
+}
+
+function parseStock(value) {
+  if (!value) return 'Unknown';
+  if (/out of stock/i.test(value)) return 'Out of stock';
+  const match = value.match(/(\d+)\s*(?:left|in stock)/i);
+  if (match) return match[1] + ' in stock';
+  return value.trim();
+}
 
 /**
  * Scrape the mock store product page for price and stock.
- * Uses Playwright to render the page, handle the anti-bot hover logic, and extract the data.
  * @param {string} url - The URL of the product page
- * @param {boolean} headed - Whether to run in headed mode for observation
+ * @param {boolean} headed - Whether to run in headed mode
  * @returns {Promise<{priceRaw: string, stockStatus: string, seller: string}>}
  */
 async function runScraper(url, headed = false) {
-  // We use chromium. Playwright can run headed or headless.
-  const browser = await chromium.launch({
-    headless: !headed,
-    // Add slowMo in headed mode so the observer can watch what happens
-    slowMo: headed ? 200 : 0
-  });
+  let lastError = null;
 
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 720 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  });
-
-  const page = await context.newPage();
-
-  try {
-    // Add a reasonable timeout for the initial load
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-    // 1. Dismiss cookie banner if present (prevents click interception)
-    const cookieAccept = page.locator('button:has-text("ACCEPT")');
-    if (await cookieAccept.count() > 0) {
-      try {
-        await cookieAccept.first().click();
-        await page.waitForTimeout(300);
-      } catch (e) {}
-    }
-
-    // 2. The store requires mouse hover over the price area to trigger the "Reveal price" button.
-    const priceBlockSelector = '.price-block';
-    await page.waitForSelector(priceBlockSelector, { state: 'visible', timeout: 15000 });
-
-    const priceBlock = page.locator(priceBlockSelector);
-    const boundingBox = await priceBlock.boundingBox();
-    if (!boundingBox) {
-      throw new Error("Could not find bounding box for price block");
-    }
-
-    // 3. Simulate human-like mouse movement over the element to unlock it
-    let currentX = boundingBox.x + 20;
-    let currentY = boundingBox.y + 20;
-    await page.mouse.move(currentX, currentY);
-
-    for (let i = 0; i < 20; i++) {
-      currentX += (Math.random() * 8) - 2;
-      currentY += (Math.random() * 8) - 2;
-      await page.mouse.move(currentX, currentY);
-      await page.waitForTimeout(50);
-    }
-    await page.waitForTimeout(600);
-
-    // 4. Click the "Reveal price" button
-    const revealBtn = page.locator('button:has-text("Reveal price")');
-    for (let clickAttempt = 0; clickAttempt < 5; clickAttempt++) {
-      const isIdle = await page.evaluate(() => {
-        const el = document.querySelector('.price-block');
-        return el ? el.classList.contains('price-idle') : false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let browser = null;
+    try {
+      browser = await chromium.launch({
+        headless: !headed,
+        slowMo: headed ? 100 : 0
       });
 
-      if (!isIdle) break;
+      const context = await browser.newContext({
+        viewport: { width: 1280, height: 800 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      });
 
-      if (await revealBtn.count() > 0) {
-        try {
-          await revealBtn.first().click({ force: true });
-        } catch (e) {}
+      const page = await context.newPage();
+      page.setDefaultTimeout(25000);
+
+      console.log(`[Attempt ${attempt}] Navigating to: ${url}`);
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+      // Dismiss cookie banner if present
+      const cookieAccept = page.getByRole('button', { name: /accept/i });
+      if (await cookieAccept.isVisible().catch(() => false)) {
+        await cookieAccept.click().catch(() => {});
+        await delay(300);
       }
-      await page.waitForTimeout(800);
-    }
 
-    // 5. Wait for price resolution or error/retry state
-    let priceRaw = null;
-    let stockStatus = null;
-    let seller = null;
+      // Find the reveal button
+      const button = page.getByRole('button', { name: /reveal price/i });
+      await button.waitFor({ state: 'visible', timeout: 15000 });
+      const box = await button.boundingBox();
+      if (!box) throw new Error('Reveal-price button has no visible bounds');
 
-    for (let attempts = 1; attempts <= 4; attempts++) {
-      try {
-        // Wait for either the price to show up, OR the error block with 'Try again'
-        const result = await Promise.race([
-          page.waitForSelector('.price-block button:has-text("Try again")', { timeout: 15000 }).then(() => 'error'),
-          page.waitForSelector('.price-block:not(.price-idle):not(:has(.spinner))', { timeout: 15000 }).then(() => 'resolved')
-        ]);
+      // Natural mouse movement over the button to trigger anti-bot verification
+      for (let step = 0; step < 10; step++) {
+        await page.mouse.move(box.x + 8 + step * 4, box.y + 8 + (step % 3) * 3);
+        await delay(80);
+      }
+      await delay(600);
+      await button.click();
 
-        if (result === 'error') {
-          if (attempts < 4) {
-            console.log(`Store returned error state on attempt ${attempts}. Clicking 'Try again'...`);
-            const tryAgainBtn = page.locator('.price-block button:has-text("Try again")');
-            if (await tryAgainBtn.count() > 0) {
-              await tryAgainBtn.first().click({ force: true });
-            }
-            await page.waitForTimeout(1000);
-            continue;
-          } else {
-            throw new Error("Store repeatedly returned error state after multiple try again attempts.");
-          }
+      // Check if .price-success resolves or if a 'Try again' error button appears
+      const outcome = await Promise.race([
+        page.locator('.price-success').waitFor({ state: 'visible', timeout: 18000 }).then(() => 'success'),
+        page.locator('.price-block button:has-text("Try again")').waitFor({ state: 'visible', timeout: 18000 }).then(() => 'retry')
+      ]);
+
+      if (outcome === 'retry') {
+        console.log(`[Attempt ${attempt}] Store gave transient error, clicking 'Try again'...`);
+        const tryAgain = page.locator('.price-block button:has-text("Try again")');
+        if (await tryAgain.count() > 0) {
+          await tryAgain.first().click({ force: true });
         }
+        await page.locator('.price-success').waitFor({ state: 'visible', timeout: 18000 });
+      }
 
-        // Wait a small moment for all DOM text nodes to settle
-        await page.waitForTimeout(600);
+      await delay(500);
 
-        const priceBlockText = await page.locator('.price-block').innerText();
+      // Extract resolved price and stock from .price-success
+      const quote = await page.locator('.price-success').evaluate(node => {
+        const priceNode = [...node.querySelectorAll('.price-main > *')]
+          .find(el => el.style && el.style.fontSize === '2.4rem') || node.querySelector('.price-main');
+        
+        const stockNode = node.querySelector('.stock-badge') || [...node.querySelectorAll('*')]
+          .find(el => /(?:in stock|left|out of stock)/i.test(el.textContent || ''));
 
-        // Extract all currency matches (e.g. ₹,183,305 and ₹,170,809)
-        const matches = priceBlockText.match(/(?:₹|Rs\.?)\s*[\d,.]+(?:\/-)?/gi);
-        if (matches && matches.length > 0) {
-          // If multiple, usually the second one is selling price after MRP, or take the smallest
-          priceRaw = matches.length > 1 ? matches[1].trim() : matches[0].trim();
-        }
+        const sellerNode = [...node.querySelectorAll('*')]
+          .find(el => /sold by/i.test(el.textContent || ''));
 
-        // Extract stock status
-        const stockMatch = priceBlockText.match(/(In stock|Out of stock|Only \d+ left|Selling fast.*?left|\d+ in stock|Hurry, just \d+ left)/i);
-        if (stockMatch) {
-          stockStatus = stockMatch[0].trim();
-        }
+        return {
+          rawPrice: priceNode ? priceNode.textContent.trim() : null,
+          rawStock: stockNode ? stockNode.textContent.trim() : null,
+          seller: sellerNode ? sellerNode.textContent.replace(/sold by/i, '').trim() : null
+        };
+      });
 
-        // Extract seller
-        const sellerMatch = priceBlockText.match(/Sold by\s+([^|\n]+)/i);
-        if (sellerMatch) {
-          seller = sellerMatch[1].trim();
-        }
+      console.log(`[Attempt ${attempt}] Raw scraped quote:`, quote);
 
-        if (priceRaw) {
-          break; // Success!
-        }
-      } catch (e) {
-        if (e.message.includes('Timeout')) {
-          throw new Error("Timeout waiting for price to resolve.");
-        }
-        throw e;
+      await browser.close();
+
+      const priceRaw = parseMoney(quote.rawPrice);
+      const stockStatus = parseStock(quote.rawStock);
+
+      if (!priceRaw) {
+        throw new Error('Price was empty after resolution');
+      }
+
+      return {
+        priceRaw,
+        stockStatus,
+        seller: quote.seller || 'INE Official Store'
+      };
+
+    } catch (err) {
+      lastError = err;
+      console.warn(`[Attempt ${attempt}] Scrape error: ${err.message}`);
+      if (browser) {
+        await browser.close().catch(() => {});
+      }
+      if (attempt < 3) {
+        const waitMs = 1500 * attempt;
+        console.log(`Waiting ${waitMs}ms before retry...`);
+        await delay(waitMs);
       }
     }
-
-    return {
-       priceRaw,
-       stockStatus: stockStatus || 'Unknown'
-    };
-
-  } finally {
-    await browser.close();
   }
-}
 
-// Helper to wait for a locator to be enabled
-async function expectEnabled(locator, timeout = 5000) {
-    const startTime = Date.now();
-    while (Date.now() - startTime < timeout) {
-        const disabled = await locator.getAttribute('disabled');
-        if (disabled === null) return true;
-        await new Promise(r => setTimeout(r, 200));
-    }
-    throw new Error("Timeout waiting for button to become enabled");
+  throw new Error(`Scrape failed after 3 attempts: ${lastError ? lastError.message : 'Unknown'}`);
 }
 
 module.exports = { runScraper };
