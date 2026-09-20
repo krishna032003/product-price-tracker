@@ -1,4 +1,4 @@
-﻿const { chromium } = require('playwright');
+const { chromium } = require('playwright');
 const path = require('path');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -6,28 +6,34 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function parseMoney(value) {
   if (!value) return null;
   const clean = value.replace(/[^\d]/g, '');
-  return clean ? '₹' + Number(clean).toLocaleString('en-IN') : value;
+  return clean ? '₹' + Number(clean).toLocaleString('en-IN') : null;
 }
 
 function parseStock(value) {
-  if (!value) return 'Unknown';
-  if (/out of stock/i.test(value)) return 'Out of stock';
-  const match = value.match(/(\d+)\s*(?:left|in stock)/i);
+  if (!value || typeof value !== 'string') return 'Unknown';
+  const trimmed = value.trim();
+  if (/out of stock/i.test(trimmed)) return 'Out of stock';
+  const match = trimmed.match(/(\d+)\s*(?:left|in stock)/i);
   if (match) return match[1] + ' in stock';
-  return value.trim();
+  if (/in stock/i.test(trimmed)) return 'In stock';
+  return 'Unknown';
 }
 
 /**
  * Scrape the mock store product page for price and stock.
  * @param {string} url - The URL of the product page
  * @param {boolean} headed - Whether to run in headed mode
+ * @param {Function} [onAttempt] - Callback: async ({ status, durationMs, errorMessage, priceRaw, stockStatus, attempt }) => void
  * @returns {Promise<{priceRaw: string, stockStatus: string, seller: string}>}
  */
-async function runScraper(url, headed = false) {
+async function runScraper(url, headed = false, onAttempt = null) {
   let lastError = null;
+  const MAX_ATTEMPTS = 3;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let browser = null;
+    const attemptStartTime = Date.now();
+
     try {
       browser = await chromium.launch({
         headless: !headed,
@@ -43,7 +49,7 @@ async function runScraper(url, headed = false) {
       const page = await context.newPage();
       page.setDefaultTimeout(25000);
 
-      console.log(`[Attempt ${attempt}] Navigating to: ${url}`);
+      console.log(`[Attempt ${attempt}/${MAX_ATTEMPTS}] Navigating to: ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
       // Dismiss cookie banner and remove overlay
@@ -56,7 +62,7 @@ async function runScraper(url, headed = false) {
       }).catch(() => {});
       await delay(500);
 
-      // Find the reveal button
+      // Find the reveal button (with 15s timeout to prevent hanging)
       const button = page.getByRole('button', { name: /reveal price/i });
       await button.waitFor({ state: 'visible', timeout: 15000 });
       const box = await button.boundingBox();
@@ -115,7 +121,19 @@ async function runScraper(url, headed = false) {
       const stockStatus = parseStock(quote.rawStock);
 
       if (!priceRaw) {
-        throw new Error('Price was empty after resolution');
+        throw new Error('Price was empty or invalid after resolution');
+      }
+
+      const attemptDuration = Date.now() - attemptStartTime;
+
+      if (onAttempt) {
+        await onAttempt({
+          status: 'SUCCESS',
+          durationMs: attemptDuration,
+          priceRaw,
+          stockStatus,
+          attempt
+        });
       }
 
       return {
@@ -126,19 +144,32 @@ async function runScraper(url, headed = false) {
 
     } catch (err) {
       lastError = err;
-      console.warn(`[Attempt ${attempt}] Scrape error: ${err.message}`);
+      const attemptDuration = Date.now() - attemptStartTime;
+      const isLast = (attempt === MAX_ATTEMPTS);
+      console.warn(`[Attempt ${attempt}/${MAX_ATTEMPTS}] Scrape error: ${err.message}`);
+
       if (browser) {
         await browser.close().catch(() => {});
       }
-      if (attempt < 3) {
+
+      if (onAttempt) {
+        await onAttempt({
+          status: isLast ? 'FAILED' : 'RETRIED',
+          durationMs: attemptDuration,
+          errorMessage: err.message,
+          attempt
+        });
+      }
+
+      if (!isLast) {
         const waitMs = 1500 * attempt;
-        console.log(`Waiting ${waitMs}ms before retry...`);
+        console.log(`Waiting ${waitMs}ms before retry attempt ${attempt + 1}...`);
         await delay(waitMs);
       }
     }
   }
 
-  throw new Error(`Scrape failed after 3 attempts: ${lastError ? lastError.message : 'Unknown'}`);
+  throw new Error(`Scrape failed after ${MAX_ATTEMPTS} attempts: ${lastError ? lastError.message : 'Unknown error'}`);
 }
 
-module.exports = { runScraper };
+module.exports = { runScraper, parseStock, parseMoney };

@@ -286,20 +286,54 @@ function App() {
                 </div>
                 
                 {priceHistory.length > 0 ? (
-                  <div className="h-72 w-full">
+                  <>
+                    <div className="h-72 w-full">
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={priceHistory}>
                         <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
                         <XAxis dataKey="time" tick={{fontSize: 11}} tickMargin={8} minTickGap={30} />
                         <YAxis domain={['auto', 'auto']} tick={{fontSize: 11}} tickFormatter={(v) => `₹${Number(v).toLocaleString('en-IN')}`} />
                         <Tooltip 
-                          formatter={(value) => [`₹${Number(value).toLocaleString('en-IN')}`, 'Price']}
+                          formatter={(value, name, item) => [
+                            `₹${Number(value).toLocaleString('en-IN')}`,
+                            `Price (Stock: ${item?.payload?.stock_status || 'Unknown'})`
+                          ]}
                           contentStyle={{borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}
                         />
                         <Line type="monotone" dataKey="price" stroke="#2563eb" strokeWidth={3} dot={{r: 4, fill: '#2563eb', strokeWidth: 0}} activeDot={{r: 6}} />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
+                  <div className="mt-4 pt-4 border-t border-gray-100">
+                      <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Recorded Price & Stock History</h3>
+                      <div className="max-h-36 overflow-y-auto border rounded-lg">
+                        <table className="w-full text-xs text-left">
+                          <thead className="bg-gray-50 text-gray-500 border-b">
+                            <tr>
+                              <th className="px-3 py-2">Recorded At</th>
+                              <th className="px-3 py-2">Price</th>
+                              <th className="px-3 py-2">Stock Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[...priceHistory].reverse().map((h, i) => (
+                              <tr key={h.id || i} className="border-b last:border-0 hover:bg-gray-50">
+                                <td className="px-3 py-1.5 text-gray-600">{h.time}</td>
+                                <td className="px-3 py-1.5 font-bold text-gray-900">₹{Number(h.price).toLocaleString('en-IN')}</td>
+                                <td className="px-3 py-1.5">
+                                  <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                                    h.stock_status?.toLowerCase().includes('out') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'
+                                  }`}>
+                                    {h.stock_status || 'Unknown'}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </>
                 ) : (
                   <div className="h-72 flex flex-col items-center justify-center bg-gray-50 rounded-xl border border-dashed text-center p-6">
                     <p className="text-gray-500 text-sm mb-3">No price history recorded yet for this item.</p>
