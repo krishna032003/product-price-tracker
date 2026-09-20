@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: price-tracker-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install && npx playwright install chromium
+    startCommand: node index.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: CRON_SECRET
+        generateValue: true
