@@ -340,6 +340,169 @@ app.get('/api/catalog', async (req, res) => {
   }
 });
 
+
+// Health check alias
+app.get('/health', (req, res) => res.json({ ok: true, status: 'ok', supabase: !!supabase }));
+
+// Codex Catalog search endpoint
+app.get('/api/catalog/search', async (req, res) => {
+  try {
+    const { items } = await getFullCatalog();
+    const q = req.query.q ? req.query.q.toLowerCase().trim() : '';
+    const filtered = items.filter(item => 
+      (item.name && item.name.toLowerCase().includes(q)) || 
+      (item.brand && item.brand.toLowerCase().includes(q)) ||
+      (item.slug && item.slug.toLowerCase().includes(q)) ||
+      (item.id && String(item.id) === q)
+    );
+    res.json(filtered.slice(0, 50));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Products list endpoint
+app.get('/api/products', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Database not configured' });
+  try {
+    const { data: products, error } = await supabase
+      .from('tracked_products')
+      .select('*, price_history(price, stock_status, scraped_at)')
+      .eq('is_tracking', true)
+      .order('added_at', { ascending: false });
+    if (error) throw error;
+
+    const formatted = products.map(p => {
+      const history = p.price_history || [];
+      const latestHist = history.sort((a, b) => new Date(b.scraped_at) - new Date(a.scraped_at))[0];
+      const stockNum = latestHist?.stock_status ? parseInt(latestHist.stock_status.match(/\d+/)?.[0] || '0') : 0;
+      return {
+        id: p.id,
+        catalog_id: Number(p.product_id) || p.product_id,
+        name: p.name,
+        brand: p.brand,
+        category: 'General',
+        sku: `SKU-${p.product_id}`,
+        active: p.is_tracking,
+        created_at: p.added_at,
+        latest: latestHist ? {
+          price: latestHist.price,
+          stock: stockNum,
+          scraped_at: latestHist.scraped_at
+        } : (p.latest_price ? {
+          price: p.latest_price,
+          stock: p.latest_stock_status ? parseInt(p.latest_stock_status.match(/\d+/)?.[0] || '0') : 0,
+          scraped_at: p.last_scraped_at
+        } : null)
+      };
+    });
+    res.json(formatted);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Product track endpoint
+app.post('/api/products', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Database not configured' });
+  try {
+    const catalogId = req.body.catalogId || req.body.product_id;
+    if (!catalogId) return res.status(400).json({ error: 'catalogId is required' });
+
+    const { items } = await getFullCatalog();
+    const item = items.find(i => String(i.id) === String(catalogId));
+    if (!item) return res.status(404).json({ error: 'Product not found in catalog' });
+
+    const row = {
+      product_id: String(item.id),
+      slug: item.slug || `product-${item.id}`,
+      name: item.name,
+      brand: item.brand || null,
+      is_tracking: true
+    };
+
+    const { data, error } = await supabase
+      .from('tracked_products')
+      .upsert(row, { onConflict: 'product_id' })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Auto-scrape in the background immediately
+    const targetUrl = `https://demo.inelabteamdev.com/product/${item.id}`;
+    runScraper(targetUrl, item.id, false, () => {}).then(res => persistScrapeResult(data, res)).catch(e => console.error("Initial scrape error:", e.message));
+
+    res.status(201).json({
+      id: data.id,
+      catalog_id: Number(data.product_id) || data.product_id,
+      name: data.name,
+      brand: data.brand,
+      category: 'General',
+      sku: `SKU-${data.product_id}`,
+      active: true,
+      created_at: data.added_at
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Product detail endpoint
+app.get('/api/products/:id', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Database not configured' });
+  try {
+    const { id } = req.params;
+    let { data: product } = await supabase
+      .from('tracked_products')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (!product) {
+      const q = await supabase.from('tracked_products').select('*').eq('product_id', id).maybeSingle();
+      product = q.data;
+    }
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    const [{ data: history }, { data: logs }] = await Promise.all([
+      supabase.from('price_history').select('*').eq('tracked_product_id', product.id).order('scraped_at', { ascending: true }),
+      supabase.from('scrape_logs').select('*').eq('tracked_product_id', product.id).order('attempted_at', { ascending: false }).limit(50)
+    ]);
+
+    const formattedHistory = (history || []).map(h => ({
+      id: h.id,
+      product_id: product.id,
+      price: h.price,
+      stock: h.stock_status ? parseInt(h.stock_status.match(/\d+/)?.[0] || '0') : 0,
+      scraped_at: h.scraped_at
+    }));
+
+    const formattedLogs = (logs || []).map(l => ({
+      id: l.id,
+      product_id: product.id,
+      status: (l.status || '').toLowerCase(),
+      created_at: l.attempted_at,
+      message: l.error_message || `Captured ${l.scraped_price_raw || ''}; ${l.scraped_stock_status || ''}`
+    }));
+
+    res.json({
+      product: {
+        id: product.id,
+        catalog_id: Number(product.product_id) || product.product_id,
+        name: product.name,
+        brand: product.brand,
+        category: 'General',
+        sku: `SKU-${product.product_id}`
+      },
+      history: formattedHistory,
+      logs: formattedLogs
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
