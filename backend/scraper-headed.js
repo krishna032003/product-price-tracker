@@ -1,7 +1,8 @@
 const { runScraper } = require('./scraper');
 
 async function test() {
-  const url = process.argv[2] || 'https://demo.inelabteamdev.com/product/237';
+  let arg = process.argv[2] || '237';
+  const url = arg.startsWith('http') ? arg : `https://demo.inelabteamdev.com/product/${arg}`;
   console.log(`Running headed scraper test on: ${url}`);
   console.log('You should see the browser open and the mouse hover over the price area to trigger the "Reveal price" button.');
   

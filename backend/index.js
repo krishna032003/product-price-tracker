@@ -58,7 +58,8 @@ app.post('/api/cron/scrape', async (req, res) => {
 
       try {
         // Run Playwright scraper
-        scrapeResult = await runScraper(`https://demo.inelabteamdev.com/product/${product.slug || product.product_id}`, false);
+        const targetUrl = `https://demo.inelabteamdev.com/product/${product.product_id}`;
+        scrapeResult = await runScraper(targetUrl, false);
         status = 'SUCCESS';
       } catch (err) {
         console.error(`Scrape failed for ${product.name}:`, err.message);

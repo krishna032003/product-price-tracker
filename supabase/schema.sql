@@ -40,3 +40,14 @@ CREATE TABLE IF NOT EXISTS public.scrape_logs (
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_price_history_product_id ON public.price_history(tracked_product_id);
 CREATE INDEX IF NOT EXISTS idx_scrape_logs_product_id ON public.scrape_logs(tracked_product_id);
+
+-- Enable Row Level Security (RLS)
+ALTER TABLE public.tracked_products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.price_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.scrape_logs ENABLE ROW LEVEL SECURITY;
+
+-- Allow public read & write access for anon / frontend & backend service
+CREATE POLICY "Allow all access to tracked_products" ON public.tracked_products FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all access to price_history" ON public.price_history FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all access to scrape_logs" ON public.scrape_logs FOR ALL USING (true) WITH CHECK (true);
+

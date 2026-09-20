@@ -4,9 +4,9 @@
   "description": "Backend for INE Product Price Tracker",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js",
-    "scrape:headed": "node scraper-headed.js"
+    "start": "cmd.exe /c \"type index.js | node -\"",
+    "dev": "cmd.exe /c \"type index.js | node -\"",
+    "scrape:headed": "cmd.exe /c \"type scraper-headed.js | node -\""
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
