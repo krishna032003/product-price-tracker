@@ -16,6 +16,21 @@ if (supabaseUrl && supabaseKey) {
 }
 
 // Ensure database connection
+
+app.get('/api/debug-tracked', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('tracked_products').select('*');
+    res.json({
+      count: data ? data.length : 0,
+      data,
+      error,
+      url: supabaseUrl ? supabaseUrl.substring(0, 30) : 'none'
+    });
+  } catch (e) {
+    res.status(500).json({ err: e.message });
+  }
+});
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', supabase: !!supabase });
 });
