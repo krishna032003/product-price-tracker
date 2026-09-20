@@ -1,4 +1,5 @@
 ﻿const { chromium } = require('playwright');
+const path = require('path');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -30,12 +31,13 @@ async function runScraper(url, headed = false) {
     try {
       browser = await chromium.launch({
         headless: !headed,
-        slowMo: headed ? 100 : 0
+        slowMo: headed ? 120 : 0
       });
 
       const context = await browser.newContext({
         viewport: { width: 1280, height: 800 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        recordVideo: headed ? { dir: path.resolve(__dirname, '../recordings'), size: { width: 1280, height: 720 } } : undefined
       });
 
       const page = await context.newPage();
@@ -44,12 +46,15 @@ async function runScraper(url, headed = false) {
       console.log(`[Attempt ${attempt}] Navigating to: ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-      // Dismiss cookie banner if present
+      // Dismiss cookie banner and remove overlay
       const cookieAccept = page.getByRole('button', { name: /accept/i });
       if (await cookieAccept.isVisible().catch(() => false)) {
         await cookieAccept.click().catch(() => {});
-        await delay(300);
       }
+      await page.evaluate(() => {
+        document.querySelectorAll('.cookie-overlay, .cookie-banner, [class*="cookie"]').forEach(el => el.remove());
+      }).catch(() => {});
+      await delay(500);
 
       // Find the reveal button
       const button = page.getByRole('button', { name: /reveal price/i });
@@ -63,7 +68,7 @@ async function runScraper(url, headed = false) {
         await delay(80);
       }
       await delay(600);
-      await button.click();
+      await button.click({ force: true });
 
       // Check if .price-success resolves or if a 'Try again' error button appears
       const outcome = await Promise.race([
@@ -102,6 +107,8 @@ async function runScraper(url, headed = false) {
 
       console.log(`[Attempt ${attempt}] Raw scraped quote:`, quote);
 
+      await page.close();
+      await context.close();
       await browser.close();
 
       const priceRaw = parseMoney(quote.rawPrice);
