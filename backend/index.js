@@ -121,6 +121,103 @@ app.post('/api/cron/scrape', async (req, res) => {
 // Endpoint for frontend to search available products in the mock store catalog
 // We could proxy the mock store's API here or fetch it directly on frontend.
 // Let's proxy it to avoid CORS issues from the frontend directly accessing the mock store if any.
+
+// Manual 'Scrape Now' endpoint for single product or all products
+app.post('/api/products/:id/scrape', async (req, res) => {
+  const { id } = req.params;
+  if (!supabase) {
+    return res.status(500).json({ error: 'Supabase not configured' });
+  }
+
+  try {
+    let { data: product } = await supabase
+      .from('tracked_products')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (!product) {
+      const q = await supabase
+        .from('tracked_products')
+        .select('*')
+        .eq('product_id', id)
+        .maybeSingle();
+      product = q.data;
+    }
+
+    if (!product) {
+      return res.status(404).json({ error: 'Tracked product not found' });
+    }
+
+    console.log('[Manual Scrape] Starting for ' + product.name + ' (ID: ' + product.product_id + ')');
+    const startTime = Date.now();
+    let scrapeResult = null;
+    let status = 'FAILED';
+    let errorMessage = null;
+
+    try {
+      const targetUrl = 'https://demo.inelabteamdev.com/product/' + product.product_id;
+      scrapeResult = await runScraper(targetUrl, false);
+      status = 'SUCCESS';
+    } catch (err) {
+      console.error('[Manual Scrape] Failed:', err.message);
+      errorMessage = err.message;
+    }
+
+    const durationMs = Date.now() - startTime;
+
+    await supabase.from('scrape_logs').insert({
+      tracked_product_id: product.id,
+      status: status,
+      duration_ms: durationMs,
+      error_message: errorMessage,
+      scraped_price_raw: scrapeResult ? scrapeResult.priceRaw : null,
+      scraped_stock_status: scrapeResult ? scrapeResult.stockStatus : null
+    });
+
+    if (status === 'SUCCESS' && scrapeResult) {
+      let numericPrice = null;
+      if (scrapeResult.priceRaw) {
+        const clean = scrapeResult.priceRaw.replace(/[^\d.]/g, '');
+        if (clean) numericPrice = parseFloat(clean);
+      }
+
+      await supabase.from('price_history').insert({
+        tracked_product_id: product.id,
+        price: numericPrice,
+        price_raw: scrapeResult.priceRaw,
+        stock_status: scrapeResult.stockStatus
+      });
+
+      await supabase.from('tracked_products').update({
+        last_scraped_at: new Date().toISOString(),
+        latest_price: numericPrice,
+        latest_stock_status: scrapeResult.stockStatus
+      }).eq('id', product.id);
+
+      return res.json({
+        success: true,
+        message: 'Product scraped successfully',
+        data: {
+          ...product,
+          latest_price: numericPrice,
+          latest_stock_status: scrapeResult.stockStatus,
+          last_scraped_at: new Date().toISOString()
+        },
+        scrapeResult
+      });
+    } else {
+      return res.status(502).json({
+        success: false,
+        error: errorMessage || 'Scraping failed'
+      });
+    }
+  } catch (err) {
+    console.error('Manual scrape error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/catalog', async (req, res) => {
   try {
     const page = req.query.page || 1;
