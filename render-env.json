@@ -1,0 +1,6 @@
+﻿[
+  {"key": "SUPABASE_URL", "value": "https://hpuunqsufpuecolqntbu.supabase.co"},
+  {"key": "SUPABASE_SERVICE_ROLE_KEY", "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhwdXVucXN1ZnB1ZWNvbHFudGJ1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4OTg0NjA3OSwiZXhwIjoyMTA1NDIyMDc5fQ.HZ_rfS4CSODu2WsYUV028HLIx8Q7WIj5plzmCdblf8M"},
+  {"key": "CRON_SECRET", "value": "my-super-secret-cron-key"},
+  {"key": "PORT", "value": "10000"}
+]

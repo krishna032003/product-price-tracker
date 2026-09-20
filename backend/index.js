@@ -2,7 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const { runScraper } = require('./scraper');
+const { runScraper, stripAnsi } = require('./scraper');
 
 const app = express();
 app.use(cors());
@@ -483,7 +483,7 @@ app.get('/api/products/:id', async (req, res) => {
       product_id: product.id,
       status: (l.status || '').toLowerCase(),
       created_at: l.attempted_at,
-      message: l.error_message || `Captured ${l.scraped_price_raw || ''}; ${l.scraped_stock_status || ''}`
+      message: l.error_message ? stripAnsi(l.error_message) : `Captured ${l.scraped_price_raw || ''}; ${l.scraped_stock_status || ''}`
     }));
 
     res.json({

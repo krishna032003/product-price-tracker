@@ -1,7 +1,15 @@
-﻿const { chromium } = require('playwright');
+const { chromium } = require('playwright');
 const path = require('path');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function stripAnsi(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str
+    .replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '')
+    .replace(/\[(?:2m|22m|\d+m)/g, '')
+    .trim();
+}
 
 /**
  * Normalizes unicode, extracts price, validates finite positive number.
@@ -13,8 +21,8 @@ function parseMoney(rawText) {
 
   const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
 
-  // Match currency symbol followed by numbers (e.g. â‚¹ 4,604 or â‚¹4604 or â‚¹35,503.00)
-  const match = normalized.match(/(?:[â‚¹\u20B9\uFFE6]|Rs\.?|INR)\s*([0-9\uFF10-\uFF19][0-9\uFF10-\uFF19,.]*)/i) ||
+  // Match currency symbol followed by numbers (e.g. ₹ 4,604 or ₹4604 or ₹35,503.00)
+  const match = normalized.match(/(?:[₹\u20B9\uFFE6]|Rs\.?|INR)\s*([0-9\uFF10-\uFF19][0-9\uFF10-\uFF19,.]*)/i) ||
                 normalized.match(/([0-9\uFF10-\uFF19][0-9\uFF10-\uFF19,.]*)/);
   if (!match) return null;
 
@@ -113,15 +121,19 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
         }
       }
 
-      // Dismiss cookie banner
-      const cookieAccept = page.getByRole('button', { name: /accept/i });
-      if (await cookieAccept.isVisible().catch(() => false)) {
-        await cookieAccept.click().catch(() => {});
+      // Dismiss cookie banner cleanly
+      const cookieAccept = page.locator('button:has-text("Accept"), button:has-text("Allow"), .cookie-banner button, .cookie-overlay button');
+      if (await cookieAccept.count() > 0 && await cookieAccept.first().isVisible().catch(() => false)) {
+        await cookieAccept.first().click().catch(() => {});
       }
       await page.evaluate(() => {
-        document.querySelectorAll('.cookie-overlay, .cookie-banner, [class*="cookie"]').forEach(el => el.remove());
+        document.querySelectorAll('.cookie-overlay, .cookie-banner, [class*="cookie"], .backdrop, .modal-backdrop').forEach(el => el.remove());
+        if (document.body) {
+          document.body.style.pointerEvents = 'auto';
+          document.body.style.overflow = 'auto';
+        }
       }).catch(() => {});
-      await delay(400);
+      await delay(300);
 
       // Locate price block and perform simulated cursor movement to satisfy bot challenge
       const priceBlock = page.locator('.price-block');
@@ -134,21 +146,30 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
         }
       }
 
-      // Correct Playwright API call: wait until button is enabled
-      const revealBtn = page.getByRole('button', { name: /reveal price/i });
+      // Wait until reveal button is enabled
+      const revealBtn = page.locator('button[aria-label="Reveal price"], button:has-text("Reveal price")');
       await page.waitForFunction(() => {
         const btn = document.querySelector('button[aria-label="Reveal price"]') || 
                     [...document.querySelectorAll('button')].find(b => /reveal price/i.test(b.textContent));
         return btn && !btn.hasAttribute('disabled');
       }, undefined, { timeout: 15000 });
 
-      // Click the enabled button naturally
-      await revealBtn.click();
+      // Clear any overlays right before click to prevent pointer interception
+      await page.evaluate(() => {
+        document.querySelectorAll('.cookie-overlay, .cookie-banner, [class*="cookie"]').forEach(el => el.remove());
+        if (document.body) document.body.style.pointerEvents = 'auto';
+      }).catch(() => {});
+
+      // Click the enabled button with force to bypass any transparent layers
+      await revealBtn.first().click({ force: true });
 
       // Handle outcome: price resolution vs transient "Try again" error
       const outcome = await Promise.race([
-        page.locator('.price-success').waitFor({ state: 'visible', timeout: 18000 }).then(() => 'success'),
-        page.locator('.price-block button:has-text("Try again")').waitFor({ state: 'visible', timeout: 18000 }).then(() => 'retry')
+        page.waitForFunction(() => !!document.querySelector('.price-main, .price-success'), undefined, { timeout: 18000 }).then(() => 'success'),
+        page.waitForFunction(() => {
+          const pb = document.querySelector('.price-block');
+          return pb && [...pb.querySelectorAll('button')].some(b => /try again/i.test(b.textContent));
+        }, undefined, { timeout: 18000 }).then(() => 'retry')
       ]);
 
       if (outcome === 'retry') {
@@ -165,19 +186,21 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
             console.error('[In-page Log Warning]:', logErr.message);
           }
         }
-        const tryAgain = page.locator('.price-block button:has-text("Try again")');
+        const tryAgain = page.locator('.price-block button:has-text("Try again"), button:has-text("Try Again")');
         if (await tryAgain.count() > 0) {
-          await tryAgain.first().click();
+          await tryAgain.first().click({ force: true });
         }
-        await page.locator('.price-success').waitFor({ state: 'visible', timeout: 18000 });
+        await page.waitForFunction(() => !!document.querySelector('.price-main, .price-success'), undefined, { timeout: 18000 });
       }
 
-      await delay(400);
+      await delay(300);
 
       // Extract resolved current deal price
-      const quote = await page.locator('.price-success').evaluate(node => {
-        const priceBlock = node.querySelector('.price-main') || node;
-        const candidates = [...priceBlock.querySelectorAll('*')];
+      const quote = await page.evaluate(() => {
+        const priceMain = document.querySelector('.price-main, .price-success');
+        if (!priceMain) return null;
+
+        const candidates = [...priceMain.querySelectorAll('*')];
 
         // 1. Look for the large deal price element
         const dealPriceEl = candidates.find(el => {
@@ -193,26 +216,21 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
           const isStruck = style.textDecorationLine?.includes('line-through') || style.textDecoration?.includes('line-through');
           const isHidden = style.display === 'none' || style.visibility === 'hidden';
           const text = (el.textContent || '').normalize('NFKC');
-          return !isStruck && !isHidden && /(?:[â‚¹\u20B9\uFFE6]|Rs\.?)\s*\d+/i.test(text);
+          return !isStruck && !isHidden && /(?:[₹\u20B9\uFFE6]|Rs\.?)\s*\d+/i.test(text);
         });
 
-        const rawPriceText = rupeeEl ? rupeeEl.textContent.trim() : priceBlock.textContent.trim();
+        const rawPriceText = rupeeEl ? (rupeeEl.innerText || rupeeEl.textContent).trim() : (priceMain.innerText || priceMain.textContent).trim();
 
         // Stock element
-        const stockNode = node.querySelector('.stock-badge') || 
-                          [...node.querySelectorAll('*')].find(el => 
-                            el.children.length === 0 && /(?:in stock|left|out of stock)/i.test(el.textContent || '')
-                          );
+        const stockNode = document.querySelector('.stock-badge, .price-facets, .st-k2, [class*="stock"]');
 
         // Seller element
-        const sellerNode = [...node.querySelectorAll('*')].find(el => 
-          el.children.length === 0 && /sold by/i.test(el.textContent || '')
-        );
+        const sellerNode = document.querySelector('.sr-k2, [class*="seller"]');
 
         return {
           rawPrice: rawPriceText,
-          rawStock: stockNode ? stockNode.textContent.trim() : null,
-          seller: sellerNode ? sellerNode.textContent.replace(/sold by/i, '').trim() : null
+          rawStock: stockNode ? (stockNode.innerText || stockNode.textContent).trim() : null,
+          seller: sellerNode ? (sellerNode.innerText || sellerNode.textContent).replace(/sold by/i, '').trim() : null
         };
       });
 
@@ -221,6 +239,10 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
       await page.close();
       await context.close();
       await browser.close();
+
+      if (!quote || !quote.rawPrice) {
+        throw new Error('Price element not found after reveal action');
+      }
 
       const parsedPrice = parseMoney(quote.rawPrice);
       const stockStatus = parseStock(quote.rawStock);
@@ -257,10 +279,11 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
       };
 
     } catch (err) {
-      lastError = err;
+      const cleanErrMsg = stripAnsi(err.message);
+      lastError = new Error(cleanErrMsg);
       const attemptDuration = Date.now() - attemptStartTime;
       const isLast = (attempt === MAX_ATTEMPTS);
-      console.warn(`[Attempt ${attempt}/${MAX_ATTEMPTS}] Scrape error: ${err.message}`);
+      console.warn(`[Attempt ${attempt}/${MAX_ATTEMPTS}] Scrape error: ${cleanErrMsg}`);
 
       if (browser) {
         await browser.close().catch(() => {});
@@ -271,7 +294,7 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
           await onAttempt({
             status: 'FAILED',
             durationMs: attemptDuration,
-            errorMessage: err.message,
+            errorMessage: cleanErrMsg,
             attempt
           });
         } catch (logErr) {
@@ -287,7 +310,7 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
     }
   }
 
-  throw new Error(`Scraper exceeded ${MAX_ATTEMPTS} attempts. Last failure: ${lastError?.message || 'unknown error'}`);
+  throw new Error(`Scraper exceeded ${MAX_ATTEMPTS} attempts. Last failure: ${stripAnsi(lastError?.message || 'unknown error')}`);
 }
 
-module.exports = { runScraper, extractProductIdFromUrl, parseMoney };
+module.exports = { runScraper, extractProductIdFromUrl, parseMoney, stripAnsi };
