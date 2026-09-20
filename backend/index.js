@@ -373,7 +373,7 @@ app.get('/api/products', async (req, res) => {
     if (error) throw error;
 
     const formatted = products.map(p => {
-      const history = p.price_history || [];
+      const history = (p.price_history || []).filter(h => Number(h.price) > 50);
       const latestHist = history.sort((a, b) => new Date(b.scraped_at) - new Date(a.scraped_at))[0];
       const stockNum = latestHist?.stock_status ? parseInt(latestHist.stock_status.match(/\d+/)?.[0] || '0') : 0;
       return {
@@ -389,7 +389,7 @@ app.get('/api/products', async (req, res) => {
           price: latestHist.price,
           stock: stockNum,
           scraped_at: latestHist.scraped_at
-        } : (p.latest_price ? {
+        } : (p.latest_price && p.latest_price > 50 ? {
           price: p.latest_price,
           stock: p.latest_stock_status ? parseInt(p.latest_stock_status.match(/\d+/)?.[0] || '0') : 0,
           scraped_at: p.last_scraped_at

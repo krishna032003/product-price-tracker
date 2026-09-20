@@ -4,40 +4,38 @@ const path = require('path');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Normalizes unicode, rejects ambiguous/multiple prices, preserves decimals.
+ * Normalizes unicode, extracts price, validates finite positive number.
  * @param {string} rawText
  * @returns {{rawText: string, numericPrice: number, displayPrice: string}|null}
  */
 function parseMoney(rawText) {
   if (!rawText || typeof rawText !== 'string') return null;
 
-  const normalized = rawText.normalize('NFKC').trim();
+  const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
 
-  // Reject ambiguous text containing multiple prices
-  const currencyMatches = normalized.match(/₹|Rs\.?|INR/gi) || [];
-  if (currencyMatches.length > 1) return null;
-
-  let clean = normalized;
-  if (/\d+\.\d{3},\d{2}/.test(clean)) {
-    // European style e.g. 4.604,50 -> 4604.50
-    clean = clean.replace(/\./g, '').replace(',', '.');
-  } else {
-    // Standard Indian / International format: strip commas, keep decimal point
-    clean = clean.replace(/,/g, '');
-  }
-
-  const match = clean.match(/(\d+(?:\.\d+)?)/);
+  // Match currency symbol followed by numbers (e.g. â‚¹ 4,604 or â‚¹4604 or â‚¹35,503.00)
+  const match = normalized.match(/(?:[â‚¹\u20B9\uFFE6]|Rs\.?|INR)\s*([0-9\uFF10-\uFF19][0-9\uFF10-\uFF19,.]*)/i) ||
+                normalized.match(/([0-9\uFF10-\uFF19][0-9\uFF10-\uFF19,.]*)/);
   if (!match) return null;
 
-  const numericPrice = parseFloat(match[1]);
-  if (!Number.isFinite(numericPrice) || numericPrice <= 0) return null;
+  let clean = match[1] || match[0];
+  if (/\d+\.\d{3},\d{2}/.test(clean)) {
+    clean = clean.replace(/\./g, '').replace(',', '.');
+  } else if (/[,.]\d{2}$/.test(clean)) {
+    clean = clean.slice(0, -3).replace(/[,.]/g, '');
+  } else {
+    clean = clean.replace(/[,.]/g, '');
+  }
+
+  const numericPrice = parseFloat(clean);
+  if (!Number.isFinite(numericPrice) || numericPrice <= 50 || numericPrice > 10000000) return null;
 
   return {
     rawText: rawText,
     numericPrice: numericPrice,
-    displayPrice: '₹' + numericPrice.toLocaleString('en-IN', {
-      minimumFractionDigits: numericPrice % 1 === 0 ? 0 : 2,
-      maximumFractionDigits: 2
+    displayPrice: '\u20B9' + numericPrice.toLocaleString('en-IN', {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0
     })
   };
 }
@@ -86,7 +84,13 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
     try {
       browser = await chromium.launch({
         headless: !headed,
-        slowMo: headed ? 120 : 0
+        slowMo: headed ? 120 : 0,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu'
+        ]
       });
 
       const context = await browser.newContext({
@@ -124,13 +128,13 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
       await priceBlock.waitFor({ state: 'visible', timeout: 15000 });
       const box = await priceBlock.boundingBox();
       if (box) {
-        for (let s = 0; s < 12; s++) {
+        for (let s = 0; s < 14; s++) {
           await page.mouse.move(box.x + 12 + s * 8, box.y + 12 + (s % 3) * 6);
-          await delay(90);
+          await delay(75);
         }
       }
 
-      // Correct Playwright API call: options is the 3rd argument (after pageFunction and undefined arg)
+      // Correct Playwright API call: wait until button is enabled
       const revealBtn = page.getByRole('button', { name: /reveal price/i });
       await page.waitForFunction(() => {
         const btn = document.querySelector('button[aria-label="Reveal price"]') || 
@@ -170,39 +174,43 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
 
       await delay(400);
 
-      // Extract resolved current deal price using leaf node filtering
+      // Extract resolved current deal price
       const quote = await page.locator('.price-success').evaluate(node => {
-        const priceMain = node.querySelector('.price-main') || node;
-        const candidates = [...priceMain.querySelectorAll('*')];
+        const priceBlock = node.querySelector('.price-main') || node;
+        const candidates = [...priceBlock.querySelectorAll('*')];
 
-        const validPriceNodes = candidates.filter(el => {
-          if (el.children.length > 0) return false;
+        // 1. Look for the large deal price element
+        const dealPriceEl = candidates.find(el => {
           const style = window.getComputedStyle(el);
-          if (style.display === 'none' || style.visibility === 'hidden' || el.getAttribute('aria-hidden') === 'true') {
-            return false;
-          }
-          if (style.textDecorationLine?.includes('line-through') || style.textDecoration?.includes('line-through')) {
-            return false;
-          }
-          const text = (el.textContent || '').trim();
-          if (/deal price/i.test(text) || /% off/i.test(text) || /updating/i.test(text)) {
-            return false;
-          }
-          return /[0-9\uFF10-\uFF19]/.test(text.normalize('NFKC'));
+          const isStruck = style.textDecorationLine?.includes('line-through') || style.textDecoration?.includes('line-through');
+          const isHidden = style.display === 'none' || style.visibility === 'hidden';
+          return !isStruck && !isHidden && (style.fontSize === '2.4rem' || el.style.fontSize === '2.4rem' || el.classList.contains('price-current') || el.classList.contains('deal-price'));
         });
 
-        const currentPriceNode = validPriceNodes[0] || null;
+        // 2. Fallback: find any element with rupee symbol and digits that is NOT struck through
+        const rupeeEl = dealPriceEl || candidates.find(el => {
+          const style = window.getComputedStyle(el);
+          const isStruck = style.textDecorationLine?.includes('line-through') || style.textDecoration?.includes('line-through');
+          const isHidden = style.display === 'none' || style.visibility === 'hidden';
+          const text = (el.textContent || '').normalize('NFKC');
+          return !isStruck && !isHidden && /(?:[â‚¹\u20B9\uFFE6]|Rs\.?)\s*\d+/i.test(text);
+        });
+
+        const rawPriceText = rupeeEl ? rupeeEl.textContent.trim() : priceBlock.textContent.trim();
+
+        // Stock element
         const stockNode = node.querySelector('.stock-badge') || 
                           [...node.querySelectorAll('*')].find(el => 
                             el.children.length === 0 && /(?:in stock|left|out of stock)/i.test(el.textContent || '')
                           );
 
+        // Seller element
         const sellerNode = [...node.querySelectorAll('*')].find(el => 
           el.children.length === 0 && /sold by/i.test(el.textContent || '')
         );
 
         return {
-          rawPrice: currentPriceNode ? currentPriceNode.textContent.trim() : null,
+          rawPrice: rawPriceText,
           rawStock: stockNode ? stockNode.textContent.trim() : null,
           seller: sellerNode ? sellerNode.textContent.replace(/sold by/i, '').trim() : null
         };
@@ -261,25 +269,25 @@ async function runScraper(url, targetProductId = null, headed = false, onAttempt
       if (onAttempt) {
         try {
           await onAttempt({
-            status: isLast ? 'FAILED' : 'RETRIED',
+            status: 'FAILED',
             durationMs: attemptDuration,
             errorMessage: err.message,
             attempt
           });
         } catch (logErr) {
-          console.error('[Attempt Failure Log Warning]:', logErr.message);
+          console.error('[Attempt Fail Log Warning]:', logErr.message);
         }
       }
 
       if (!isLast) {
         const waitMs = 1500 * attempt;
-        console.log(`Waiting ${waitMs}ms before retry attempt ${attempt + 1}...`);
+        console.log(`Waiting ${waitMs}ms before attempt ${attempt + 1}...`);
         await delay(waitMs);
       }
     }
   }
 
-  throw new Error(`Scrape failed after ${MAX_ATTEMPTS} attempts: ${lastError ? lastError.message : 'Unknown error'}`);
+  throw new Error(`Scraper exceeded ${MAX_ATTEMPTS} attempts. Last failure: ${lastError?.message || 'unknown error'}`);
 }
 
-module.exports = { runScraper, parseStock, parseMoney, extractProductIdFromUrl };
+module.exports = { runScraper, extractProductIdFromUrl, parseMoney };
